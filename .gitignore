@@ -28,6 +28,8 @@ mlruns/
 
 # Local backup of the team folder
 submissions/group-number-8 old/
+submissions/better_models/
+submissions/group-number-8 copy/
 
 # OS / editor
 .DS_Store
