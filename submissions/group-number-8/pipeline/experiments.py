@@ -1,8 +1,8 @@
 """Course experiments on the fixed 2,000-row validation split.
 
-Train and validation AUROC for lr_bpe, sgd_bpe, and gbm_format are computed
-here, along with the 3-fold search on the 8,000-row partition. The Kaggle
-test file is not read in this module.
+The three single models, the gbm_format learning curve, the sgd_bpe unlabeled
+feature comparison, and the gbm_format length bins and errors are computed
+here. The Kaggle test file is not read in this module.
 """
 
 from __future__ import annotations
@@ -11,19 +11,25 @@ import json
 import time
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from pipeline.config import (
+    DECISION_THRESHOLD,
     GBM_GRID,
+    LEARNING_CURVE_SIZES,
     LR_CS,
     N_INNER_FOLDS,
     SGD_ALPHAS,
     SPLIT_SEED,
 )
-from pipeline.data import exact_text_overlap, validation_split
+from pipeline.data import exact_text_overlap, stratified_prefix, validation_split
 from pipeline.features import (
     FORMAT_COLUMNS,
     build_word_features,
@@ -94,9 +100,18 @@ def _mean_diff(x_matrix: np.ndarray, y: np.ndarray) -> list[dict]:
     return rows
 
 
+def _preview(text: str, limit: int = 280) -> str:
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1].rstrip() + "…"
+
+
 def run_report(
     train_df: pd.DataFrame,
+    unlabeled_df: pd.DataFrame,
     metrics_path: Path,
+    figure_path: Path,
     seed: int = SPLIT_SEED,
 ) -> dict:
     train_part, val_part = validation_split(train_df, seed=seed)
@@ -193,6 +208,7 @@ def run_report(
             "train_auroc": _auroc(y_train, train_scores),
             "val_auroc": _auroc(y_val, val_scores),
             "train_seconds": seconds,
+            "val_proba": model.predict_proba(x_val)[:, 1],
         }
         print(
             f"  {name} train {locked[name]['train_auroc']:.4f} "
@@ -211,6 +227,149 @@ def run_report(
             }
         )
     metrics["models"] = model_rows
+
+    print("learning curve on gbm_format", flush=True)
+    curve = []
+    for size in LEARNING_CURVE_SIZES:
+        subset = stratified_prefix(train_part, size, seed)
+        model, train_scores, val_scores, seconds = _fit_scores(
+            make_gbm,
+            format_matrix(subset["text"]),
+            subset["label"].to_numpy(),
+            x_fmt_val,
+        )
+        row = {
+            "n": int(size),
+            "n_human": int((subset["label"] == 0).sum()),
+            "n_ai": int((subset["label"] == 1).sum()),
+            "train_auroc": _auroc(subset["label"], train_scores),
+            "val_auroc": _auroc(y_val, val_scores),
+            "train_seconds": seconds,
+        }
+        curve.append(row)
+        print(f"  n={size} train {row['train_auroc']:.4f} val {row['val_auroc']:.4f}", flush=True)
+    metrics["learning_curve_model"] = "gbm_format"
+    metrics["learning_curve"] = curve
+    _plot_curve(curve, figure_path)
+
+    print("unlabeled feature learning for sgd_bpe", flush=True)
+    unlabeled_flat = flatten_text(unlabeled_df["text"]).tolist()
+    _, _, unlabeled_matrices, unlabeled_info = build_word_features(
+        train_flat + unlabeled_flat,
+        {"train": train_flat, "val": val_flat},
+    )
+    model, train_scores, val_scores, seconds = _fit_scores(
+        make_sgd,
+        unlabeled_matrices["train"],
+        y_train,
+        unlabeled_matrices["val"],
+    )
+    supervised = next(row for row in model_rows if row["name"] == "sgd_bpe")
+    metrics["unlabeled"] = {
+        "method": "bpe_and_tfidf_fit_on_train_partition_plus_unlabeled",
+        "n_unlabeled": int(len(unlabeled_df)),
+        "features": unlabeled_info,
+        "supervised_train_auroc": supervised["train_auroc"],
+        "supervised_val_auroc": supervised["val_auroc"],
+        "supervised_seconds": supervised["train_seconds"],
+        "with_unlabeled_train_auroc": _auroc(y_train, train_scores),
+        "with_unlabeled_val_auroc": _auroc(y_val, val_scores),
+        "with_unlabeled_seconds": seconds,
+    }
+    print(
+        f"  supervised {supervised['val_auroc']:.4f} "
+        f"with unlabeled {metrics['unlabeled']['with_unlabeled_val_auroc']:.4f}",
+        flush=True,
+    )
+
+    print("length bins and errors on gbm_format", flush=True)
+    words = val_part["text"].str.split().str.len().fillna(0).to_numpy()
+    q1, q2 = np.quantile(words, [1 / 3, 2 / 3])
+    bins = [
+        ("short", words <= q1),
+        ("medium", (words > q1) & (words <= q2)),
+        ("long", words > q2),
+    ]
+    bin_rows = []
+    val_scores = np.asarray(locked["gbm_format"]["val_proba"], dtype=np.float64)
+    for name, mask in bins:
+        bin_rows.append(
+            {
+                "bin": name,
+                "rule": {
+                    "short": f"word count <= {q1:.0f}",
+                    "medium": f"{q1:.0f} < word count <= {q2:.0f}",
+                    "long": f"word count > {q2:.0f}",
+                }[name],
+                "q1": float(q1),
+                "q2": float(q2),
+                "count": int(mask.sum()),
+                "n_human": int((y_val[mask] == 0).sum()),
+                "n_ai": int((y_val[mask] == 1).sum()),
+                "val_auroc": _auroc(y_val[mask], val_scores[mask]),
+                "mean_words": float(words[mask].mean()),
+            }
+        )
+    metrics["length_bins_model"] = "gbm_format"
+    metrics["length_bins"] = bin_rows
+
+    predicted_ai = val_scores >= DECISION_THRESHOLD
+    false_positive = predicted_ai & (y_val == 0)
+    false_negative = (~predicted_ai) & (y_val == 1)
+    fp_order = np.argsort(-val_scores)
+    fn_order = np.argsort(val_scores)
+    errors = {
+        "threshold": DECISION_THRESHOLD,
+        "score": "gbm_format_proba",
+        "false_positives": [],
+        "false_negatives": [],
+    }
+    for index in fp_order:
+        if not false_positive[index]:
+            continue
+        errors["false_positives"].append(_error_row(val_part, words, val_scores, index, "FP"))
+        if len(errors["false_positives"]) == 5:
+            break
+    for index in fn_order:
+        if not false_negative[index]:
+            continue
+        errors["false_negatives"].append(_error_row(val_part, words, val_scores, index, "FN"))
+        if len(errors["false_negatives"]) == 5:
+            break
+    errors["n_fp"] = int(false_positive.sum())
+    errors["n_fn"] = int(false_negative.sum())
+    errors["n_correct"] = int((predicted_ai == (y_val == 1)).sum())
+    metrics["errors"] = errors
+
     _write(metrics_path, metrics)
     print(f"wrote {metrics_path}", flush=True)
     return metrics
+
+
+def _error_row(val_part, words, scores, index: int, kind: str) -> dict:
+    return {
+        "id": int(val_part.iloc[index]["id"]),
+        "error_type": kind,
+        "label": int(val_part.iloc[index]["label"]),
+        "p_ai": float(scores[index]),
+        "n_words": int(words[index]),
+        "preview": _preview(str(val_part.iloc[index]["text"])),
+    }
+
+
+def _plot_curve(curve: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sizes = [row["n"] for row in curve]
+    fig, ax = plt.subplots(figsize=(6.4, 3.8))
+    ax.plot(sizes, [row["train_auroc"] for row in curve], marker="o", color="#19334C", label="Training AUROC")
+    ax.plot(sizes, [row["val_auroc"] for row in curve], marker="o", color="#236B82", label="Validation AUROC")
+    ax.set_xlabel("Labeled training rows")
+    ax.set_ylabel("AUROC")
+    ax.set_xticks(sizes)
+    scores = [row["train_auroc"] for row in curve] + [row["val_auroc"] for row in curve]
+    ax.set_ylim(max(0.5, min(scores) - 0.02), 1.005)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)

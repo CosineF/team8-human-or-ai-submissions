@@ -2,13 +2,16 @@
 
 The validation split is the course holdout: 2,000 stratified rows from
 train.csv, seed 20261023. Classifier seeds and hyperparameters are the
-settings of lr_bpe, sgd_bpe, and gbm_format.
+settings of lr_bpe, sgd_bpe, and gbm_format. The learning-curve sizes and
+the 0.5 error threshold are for the gbm_format checks in the report.
 """
 
 SPLIT_SEED = 20261023
 MODEL_SEED = 42
 VAL_SIZE = 2000
 N_INNER_FOLDS = 3
+LEARNING_CURVE_SIZES = (500, 1000, 2000, 5000, 8000)
+DECISION_THRESHOLD = 0.5
 
 BPE_VOCAB_SIZE = 30_000
 BPE_MIN_FREQUENCY = 2
