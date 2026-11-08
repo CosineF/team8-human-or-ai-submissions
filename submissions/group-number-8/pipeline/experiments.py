@@ -1,8 +1,7 @@
 """Course experiments on the fixed 2,000-row validation split.
 
-The three single models, the gbm_format learning curve, the sgd_bpe unlabeled
-feature comparison, and the gbm_format length bins and errors are computed
-here. The Kaggle test file is not read in this module.
+Every AUROC in results/metrics.json is computed here. The Kaggle test file
+is not read in this module.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ from pipeline.features import (
     flatten_text,
     format_matrix,
 )
-from pipeline.models import make_gbm, make_lr, make_sgd
+from pipeline.models import make_gbm, make_lr, make_sgd, rank_average
 
 
 def _auroc(y_true, scores) -> float:
@@ -216,6 +215,37 @@ def run_report(
             flush=True,
         )
 
+    def _pack_ensemble(names: list[str]) -> dict:
+        train_scores = rank_average([locked[name]["train_scores"] for name in names])
+        val_scores = rank_average([locked[name]["val_scores"] for name in names])
+        val_proba = np.mean([locked[name]["val_proba"] for name in names], axis=0)
+        pairs = []
+        for left_i, left in enumerate(names):
+            for right in names[left_i + 1 :]:
+                corr = float(
+                    pd.Series(locked[left]["val_scores"]).corr(
+                        pd.Series(locked[right]["val_scores"]), method="spearman"
+                    )
+                )
+                pairs.append({"a": left, "b": right, "spearman_val": corr})
+        return {
+            "members": names,
+            "train_auroc": _auroc(y_train, train_scores),
+            "val_auroc": _auroc(y_val, val_scores),
+            "val_auroc_mean_proba": _auroc(y_val, val_proba),
+            "train_seconds": float(sum(locked[name]["train_seconds"] for name in names)),
+            "val_scores": val_scores,
+            "val_proba": val_proba,
+            "spearman_val": pairs,
+        }
+
+    ens_top2 = _pack_ensemble(["sgd_bpe", "gbm_format"])
+    ens_top3 = _pack_ensemble(["sgd_bpe", "lr_bpe", "gbm_format"])
+    print(
+        f"  ens_top2 val {ens_top2['val_auroc']:.4f}  ens_top3 val {ens_top3['val_auroc']:.4f}",
+        flush=True,
+    )
+
     model_rows = []
     for name in ("lr_bpe", "sgd_bpe", "gbm_format"):
         model_rows.append(
@@ -224,6 +254,18 @@ def run_report(
                 "train_auroc": locked[name]["train_auroc"],
                 "val_auroc": locked[name]["val_auroc"],
                 "train_seconds": locked[name]["train_seconds"],
+            }
+        )
+    for name, packed in (("ens_top2", ens_top2), ("ens_top3", ens_top3)):
+        model_rows.append(
+            {
+                "name": name,
+                "train_auroc": packed["train_auroc"],
+                "val_auroc": packed["val_auroc"],
+                "val_auroc_mean_proba": packed["val_auroc_mean_proba"],
+                "train_seconds": packed["train_seconds"],
+                "members": packed["members"],
+                "spearman_val": packed["spearman_val"],
             }
         )
     metrics["models"] = model_rows
@@ -282,7 +324,7 @@ def run_report(
         flush=True,
     )
 
-    print("length bins and errors on gbm_format", flush=True)
+    print("length bins and errors on ens_top2", flush=True)
     words = val_part["text"].str.split().str.len().fillna(0).to_numpy()
     q1, q2 = np.quantile(words, [1 / 3, 2 / 3])
     bins = [
@@ -291,7 +333,7 @@ def run_report(
         ("long", words > q2),
     ]
     bin_rows = []
-    val_scores = np.asarray(locked["gbm_format"]["val_proba"], dtype=np.float64)
+    val_scores = ens_top2["val_scores"]
     for name, mask in bins:
         bin_rows.append(
             {
@@ -310,20 +352,15 @@ def run_report(
                 "mean_words": float(words[mask].mean()),
             }
         )
-    metrics["length_bins_model"] = "gbm_format"
+    metrics["length_bins_model"] = "ens_top2"
     metrics["length_bins"] = bin_rows
 
     predicted_ai = val_scores >= DECISION_THRESHOLD
     false_positive = predicted_ai & (y_val == 0)
     false_negative = (~predicted_ai) & (y_val == 1)
-    fp_order = np.argsort(-val_scores)
+    fp_order = np.argsort(-val_scores) 
     fn_order = np.argsort(val_scores)
-    errors = {
-        "threshold": DECISION_THRESHOLD,
-        "score": "gbm_format_proba",
-        "false_positives": [],
-        "false_negatives": [],
-    }
+    errors = {"threshold": DECISION_THRESHOLD, "score": "rank_average", "false_positives": [], "false_negatives": []}
     for index in fp_order:
         if not false_positive[index]:
             continue
@@ -340,7 +377,11 @@ def run_report(
     errors["n_fn"] = int(false_negative.sum())
     errors["n_correct"] = int((predicted_ai == (y_val == 1)).sum())
     metrics["errors"] = errors
+    metrics["final_model"] = "ens_top2"
+    metrics["final_train_auroc"] = ens_top2["train_auroc"]
+    metrics["final_val_auroc"] = ens_top2["val_auroc"]
 
+    # Drop bulky arrays before saving. val_ids stay so the split can be checked.
     _write(metrics_path, metrics)
     print(f"wrote {metrics_path}", flush=True)
     return metrics
@@ -373,3 +414,39 @@ def _plot_curve(curve: list[dict], path: Path) -> None:
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def fit_ensembles(train_df: pd.DataFrame, unlabeled_df: pd.DataFrame, test_df: pd.DataFrame):
+    """Fit the submission models the way the notebooks do.
+
+    BPE and TF-IDF see train, unlabeled, and test text. Classifiers see only
+    labeled train rows. Returned labels are rank averages on the test set.
+    """
+    from pipeline.features import format_features
+
+    frames = {"train": train_df, "unlabeled": unlabeled_df, "test": test_df}
+    flat = {name: flatten_text(frame["text"]).tolist() for name, frame in frames.items()}
+    fit_docs = flat["train"] + flat["unlabeled"] + flat["test"]
+    tokenizer, vectorizer, matrices, info = build_word_features(fit_docs, flat)
+    y_train = train_df["label"].to_numpy()
+    format_by_split = {name: format_features(frame["text"]) for name, frame in frames.items()}
+
+    sgd = make_sgd().fit(matrices["train"], y_train)
+    gbm = make_gbm().fit(format_by_split["train"], y_train)
+    lr = make_lr().fit(matrices["train"], y_train)
+    sgd_test = np.asarray(sgd.decision_function(matrices["test"]), dtype=np.float64)
+    gbm_test = np.asarray(gbm.decision_function(format_by_split["test"]), dtype=np.float64)
+    lr_test = np.asarray(lr.decision_function(matrices["test"]), dtype=np.float64)
+    labels = {
+        "ens_top2": rank_average([sgd_test, gbm_test]),
+        "ens_top3": rank_average([sgd_test, gbm_test, lr_test]),
+    }
+    bundle = {
+        "kind": "ens_top2",
+        "tokenizer_json": tokenizer.to_str(),
+        "vectorizer": vectorizer,
+        "sgd": sgd,
+        "gbm": gbm,
+        "feature_info": info,
+    }
+    return labels, bundle

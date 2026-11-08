@@ -1,9 +1,8 @@
-"""Locked protocol and the settings of the three single models.
+"""Locked protocol and the model settings used in the report.
 
 The validation split is the course holdout: 2,000 stratified rows from
 train.csv, seed 20261023. Classifier seeds and hyperparameters are the
-settings of lr_bpe, sgd_bpe, and gbm_format. The learning-curve sizes and
-the 0.5 error threshold are for the gbm_format checks in the report.
+settings of the five models we kept (three single models, two ensembles).
 """
 
 SPLIT_SEED = 20261023
@@ -24,7 +23,7 @@ TFIDF_MAX_FEATURES = 500_000
 # SGD alpha: 1e-5 -> 0.9468, 5e-5 -> 0.9619, 1e-4 -> 0.9631, 5e-4 -> 0.9605.
 # Logistic C: 1 -> 0.9522, 4 -> 0.9590, 16 -> 0.9618.
 # GBM grid: 0.9886 to 0.9894; the locked row was 0.9893.
-# Neighbors beat 5e-5 and C=4 by at most 0.003, so the locked models keep those values.
+# Neighbors beat 5e-5 and C=4 by at most 0.003, so the submitted models keep those values.
 SGD_ALPHA = 5e-5
 SGD_ALPHAS = (1e-5, 5e-5, 1e-4, 5e-4)
 LR_C = 4.0
@@ -42,3 +41,5 @@ GBM_GRID = (
     {"learning_rate": 0.1, "max_leaf_nodes": 15, "l2_regularization": 1.0},
     {"learning_rate": 0.1, "max_leaf_nodes": 31, "l2_regularization": 0.1},
 )
+
+FINAL_MODEL = "ens_top2"

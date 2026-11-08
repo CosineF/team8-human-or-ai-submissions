@@ -1,10 +1,15 @@
-"""Classifiers for the three single models.
+"""Classifiers and the rank-average ensembles.
 
-lr_bpe and sgd_bpe score BPE TF-IDF. gbm_format scores the 21 layout features.
+ENS_top2 averages sgd_bpe and gbm_format. ENS_top3 adds lr_bpe with equal
+weight. Scores are percentile ranks inside the set being scored, because
+AUROC depends only on order and the three models are not on one scale.
 """
 
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
+from scipy.stats import rankdata
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 
@@ -48,3 +53,22 @@ def make_gbm(
         l2_regularization=l2_regularization,
         random_state=seed,
     )
+
+
+def rank01(scores: np.ndarray) -> np.ndarray:
+    return (rankdata(np.asarray(scores, dtype=np.float64)) - 1) / max(len(scores) - 1, 1)
+
+
+def rank_average(score_columns: list[np.ndarray]) -> np.ndarray:
+    return np.mean([rank01(column) for column in score_columns], axis=0)
+
+
+def submission_frame(ids: pd.Series, labels: np.ndarray) -> pd.DataFrame:
+    frame = pd.DataFrame({"id": ids.astype(int).to_numpy(), "label": labels})
+    if frame["id"].duplicated().any():
+        raise ValueError("Duplicate ids in submission")
+    if frame["label"].isna().any() or not np.isfinite(frame["label"]).all():
+        raise ValueError("Submission labels must be finite")
+    if not ((frame["label"] >= 0) & (frame["label"] <= 1)).all():
+        raise ValueError("Submission labels must lie in [0, 1]")
+    return frame
